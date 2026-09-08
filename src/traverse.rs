@@ -737,6 +737,7 @@ pub struct BackgroundTraversal {
     pub stats: TraversalStats,
     /// Root nodes in input order; populated as root traversal events are integrated.
     pub(crate) root_nodes: Vec<Option<TreeIndex>>,
+    removed_roots: Vec<bool>,
     /// Retained tree node for each dense directory identifier emitted by the walker.
     nodes_by_directory: Vec<Option<TreeIndex>>,
     inodes: InodeFilter,
@@ -744,7 +745,7 @@ pub struct BackgroundTraversal {
     skip_root: bool,
     use_root_path: bool,
     retained_depth: Option<usize>,
-    preexisting_nodes: HashMap<PathBuf, (TreeIndex, bool)>,
+    preexisting_nodes: HashMap<PathBuf, (Option<TreeIndex>, bool)>,
     /// Receiver used to obtain traversal events from the worker thread.
     pub event_rx: Receiver<TraversalEvent>,
 }
@@ -802,7 +803,7 @@ impl BackgroundTraversal {
             use_root_path,
             preexisting_nodes
                 .into_iter()
-                .map(|(path, index, needs_metadata)| (path, (index, needs_metadata)))
+                .map(|(path, index, needs_metadata)| (path, (Some(index), needs_metadata)))
                 .collect(),
         )
     }
@@ -814,7 +815,7 @@ impl BackgroundTraversal {
         pattern_roots: Option<&[PathBuf]>,
         skip_root: bool,
         use_root_path: bool,
-        preexisting_nodes: HashMap<PathBuf, (TreeIndex, bool)>,
+        preexisting_nodes: HashMap<PathBuf, (Option<TreeIndex>, bool)>,
     ) -> anyhow::Result<BackgroundTraversal> {
         let num_roots = input.len();
         let (entry_tx, entry_rx) = crossbeam::channel::bounded(100);
@@ -900,6 +901,7 @@ impl BackgroundTraversal {
             root_idx,
             stats: TraversalStats::default(),
             root_nodes: vec![None; num_roots],
+            removed_roots: vec![false; num_roots],
             nodes_by_directory: Vec::new(),
             inodes: InodeFilter::default(),
             throttle: Some(Throttle::new(Duration::from_millis(250), None)),
@@ -911,10 +913,39 @@ impl BackgroundTraversal {
         })
     }
 
-    /// Return the top-level nodes in the same order as the traversal inputs once all roots exist.
+    /// Return surviving top-level nodes in input order once all remaining roots exist.
     #[must_use]
     pub fn root_nodes(&self) -> Option<Vec<TreeIndex>> {
-        self.root_nodes.iter().copied().collect()
+        self.root_nodes
+            .iter()
+            .zip(&self.removed_roots)
+            .filter_map(|(&node, &removed)| (!removed).then_some(node))
+            .collect()
+    }
+
+    /// Forget removed nodes before their slots can be reused by further tree insertions.
+    ///
+    /// Return `false` if the integration root was removed and this scan must be cancelled.
+    #[must_use]
+    pub fn prune_removed_nodes(&mut self, tree: &Tree) -> bool {
+        if !tree.contains(self.root_idx) {
+            return false;
+        }
+        for (node, removed) in self.root_nodes.iter_mut().zip(&mut self.removed_roots) {
+            if node.is_some_and(|index| !tree.contains(index)) {
+                *node = None;
+                *removed = true;
+            }
+        }
+        // ponytail: one table pass per deletion; add reverse links if bulk deletion makes this costly.
+        for node in self
+            .nodes_by_directory
+            .iter_mut()
+            .chain(self.preexisting_nodes.values_mut().map(|(node, _)| node))
+        {
+            *node = node.filter(|index| tree.contains(*index));
+        }
+        true
     }
 
     /// Keep tree nodes through `depth`, while still aggregating all sizes, or retain all nodes when
@@ -931,7 +962,7 @@ impl BackgroundTraversal {
         root_idx: usize,
         root_path: &Path,
     ) {
-        if self.skip_root {
+        if self.skip_root || self.removed_roots[root_idx] {
             return;
         }
         // Entry errors carry no descendant path, so report them on the corresponding root.
@@ -964,15 +995,16 @@ impl BackgroundTraversal {
         self.root_nodes[root_idx] = Some(node);
     }
 
-    fn set_directory_node(&mut self, directory_id: usize, node: TreeIndex) {
+    fn set_directory_node(&mut self, directory_id: usize, node: Option<TreeIndex>) {
         if self.nodes_by_directory.len() <= directory_id {
             self.nodes_by_directory.resize(directory_id + 1, None);
         }
-        self.nodes_by_directory[directory_id] = Some(node);
+        self.nodes_by_directory[directory_id] = node;
     }
 
     /// Integrate `event` into traversal `t` so its information is represented by it.
     /// This builds the traversal tree from a directory-walk.
+    /// Descendants of nodes forgotten by [`Self::prune_removed_nodes`] are ignored.
     ///
     /// Returns
     /// * `Some(true)` if the traversal is finished
@@ -1006,6 +1038,37 @@ impl BackgroundTraversal {
                         .then_some(false);
                 };
                 let walk_depth = entry.depth;
+                let preexisting = if self.preexisting_nodes.is_empty() {
+                    None
+                } else {
+                    self.preexisting_nodes.remove(&entry.path())
+                };
+                let parent_index = if matches!(preexisting, Some((None, _))) {
+                    None
+                } else if walk_depth == 0 {
+                    Some(self.root_idx)
+                } else {
+                    let parent_id = entry
+                        .parent_directory_id
+                        .expect("non-root entries have a parent directory identifier");
+                    if self.skip_root && walk_depth == 1 {
+                        self.set_directory_node(parent_id.index(), Some(self.root_idx));
+                    }
+                    self.nodes_by_directory
+                        .get(parent_id.index())
+                        .copied()
+                        .expect("parent entries are emitted before their children")
+                };
+                let Some(parent_index) = parent_index else {
+                    if let Some(directory_id) = entry.directory_id {
+                        self.set_directory_node(directory_id.index(), None);
+                    }
+                    return self
+                        .throttle
+                        .as_ref()
+                        .is_some_and(|t| t.can_update())
+                        .then_some(false);
+                };
                 let name = if !self.skip_root && walk_depth == 0 && self.use_root_path {
                     root_path.as_path()
                 } else {
@@ -1063,14 +1126,9 @@ impl BackgroundTraversal {
                     data.entry_count = Some(1);
                 }
                 let entry_count = u64::from(data.is_dir || data.entry_count != Some(0));
-                let preexisting = if self.preexisting_nodes.is_empty() {
-                    None
-                } else {
-                    self.preexisting_nodes.remove(&entry.path())
-                };
-                if let Some((index, needs_metadata)) = preexisting {
+                if let Some((Some(index), needs_metadata)) = preexisting {
                     if let Some(directory_id) = entry.directory_id {
-                        self.set_directory_node(directory_id.index(), index);
+                        self.set_directory_node(directory_id.index(), Some(index));
                     }
                     if needs_metadata {
                         traversal.tree.update(index, |existing| {
@@ -1100,21 +1158,6 @@ impl BackgroundTraversal {
                 }
                 let retain_entry = self.retained_depth.is_none_or(|depth| walk_depth <= depth);
 
-                let parent_index = if walk_depth == 0 {
-                    self.root_idx
-                } else {
-                    let parent_id = entry
-                        .parent_directory_id
-                        .expect("non-root entries have a parent directory identifier");
-                    if self.skip_root && walk_depth == 1 {
-                        self.set_directory_node(parent_id.index(), self.root_idx);
-                    }
-                    self.nodes_by_directory
-                        .get(parent_id.index())
-                        .copied()
-                        .flatten()
-                        .expect("parent entries are emitted before their children")
-                };
                 let mut retained_node = None;
                 if retain_entry {
                     let entry_index = traversal.tree.add_child(parent_index, name, data);
@@ -1126,7 +1169,7 @@ impl BackgroundTraversal {
                 if let Some(directory_id) = entry.directory_id {
                     self.set_directory_node(
                         directory_id.index(),
-                        retained_node.unwrap_or(parent_index),
+                        Some(retained_node.unwrap_or(parent_index)),
                     );
                 }
 

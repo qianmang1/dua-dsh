@@ -30,6 +30,136 @@ fn marked_file_names(app: &TerminalApp, message: &str) -> BTreeSet<String> {
 }
 
 #[test]
+fn deletion_during_scan_ignores_queued_descendants() -> anyhow::Result<()> {
+    use crate::interactive::app::tests::utils::{
+        index_by_name, untraversed_app_and_terminal_with_closure,
+    };
+    use crate::interactive::app::tree_view::TreeView;
+    use dua::traverse::TraversalEvent;
+    use std::{collections::VecDeque, io, path::Path, sync::Arc};
+
+    for reuse_slot in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let removed = dir.path().join("removed");
+        let kept = dir.path().join("kept");
+        fs::create_dir_all(removed.join("nested/deep"))?;
+        fs::write(removed.join("nested/deep/file"), b"deleted")?;
+        fs::write(&kept, b"keep")?;
+        let (_, mut app) = untraversed_app_and_terminal_with_closure(
+            &[removed.clone(), kept.clone()],
+            Path::to_path_buf,
+        )?;
+        app.traverse()?;
+
+        // Queue the complete walk so deletion always precedes descendant integration.
+        let scan = &mut app.state.scan.as_mut().unwrap().active_traversal;
+        let (mut removed_events, mut kept_events): (VecDeque<_>, VecDeque<_>) = scan
+            .event_rx
+            .iter()
+            .filter(|event| !matches!(event, TraversalEvent::Finished))
+            .partition(|event| matches!(event, TraversalEvent::Entry(_, _, _, 0)));
+        scan.integrate_traversal_event(&mut app.traversal, removed_events.pop_front().unwrap());
+        let removed_index = index_by_name(&app, &removed);
+        let mut tree_view = TreeView {
+            traversal: &mut app.traversal,
+            glob_tree_root: None,
+            glob_matches: None,
+        };
+        fs::remove_dir_all(&removed)?;
+        app.state
+            .delete_entries_in_traversal(removed_index, &mut tree_view);
+        assert!(!removed.exists());
+
+        let scan = &mut app.state.scan.as_mut().unwrap().active_traversal;
+        if reuse_slot {
+            for event in kept_events.drain(..) {
+                scan.integrate_traversal_event(&mut app.traversal, event);
+            }
+            assert_eq!(
+                app.traversal.tree.name(removed_index).as_deref(),
+                Some(kept.as_path()),
+                "the deleted parent slot is now an unrelated file"
+            );
+        }
+        for event in removed_events.into_iter().chain(kept_events) {
+            scan.integrate_traversal_event(&mut app.traversal, event);
+        }
+        scan.integrate_traversal_event(
+            &mut app.traversal,
+            TraversalEvent::Entry(
+                Err(io::Error::other("directory removed during the scan")),
+                Arc::new(removed),
+                0,
+                0,
+            ),
+        );
+        assert_eq!(
+            scan.integrate_traversal_event(&mut app.traversal, TraversalEvent::Finished),
+            Some(true)
+        );
+        assert_eq!(scan.stats.total_bytes, Some(4));
+        assert_eq!(scan.stats.io_errors, 1);
+        let roots = scan.root_nodes().unwrap();
+        assert_eq!(roots.len(), 1, "deleted roots are excluded from snapshots");
+        assert_eq!(
+            app.traversal.tree.name(roots[0]).as_deref(),
+            Some(kept.as_path())
+        );
+        assert!(!app.traversal.tree.data(roots[0]).unwrap().metadata_io_error);
+        assert_eq!(app.traversal.tree.len(), 2);
+        assert_eq!(
+            app.traversal
+                .tree
+                .data(app.traversal.root_index)
+                .unwrap()
+                .entry_count,
+            Some(1)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn deleting_the_directory_being_refreshed_cancels_its_scan() -> Result<()> {
+    use crate::interactive::app::{
+        state::FilesystemScan, tests::utils::index_by_name, tree_view::TreeView,
+    };
+    use dua::traverse::BackgroundTraversal;
+
+    let dir = tempfile::tempdir()?;
+    let removed = dir.path().join("removed");
+    fs::create_dir(&removed)?;
+    fs::write(removed.join("file"), b"content")?;
+    let (_, mut app) = initialized_app_and_terminal_from_paths(std::slice::from_ref(&removed))?;
+    let removed_index = index_by_name(&app, &removed);
+    app.state.scan = Some(FilesystemScan {
+        active_traversal: BackgroundTraversal::start(
+            removed_index,
+            &app.state.walk_options,
+            vec![removed.clone()],
+            None,
+            true,
+            false,
+        )?,
+        previous_selection: None,
+        snapshot_export: None,
+    });
+    fs::remove_dir_all(removed)?;
+    app.state.delete_entries_in_traversal(
+        removed_index,
+        &mut TreeView {
+            traversal: &mut app.traversal,
+            glob_tree_root: None,
+            glob_matches: None,
+        },
+    );
+    assert!(app.state.scan.is_none());
+    assert_eq!(app.traversal.tree.len(), 1);
+    assert_eq!(app.state.navigation().view_root, app.traversal.root_index);
+    Ok(())
+}
+
+#[test]
 #[cfg(not(target_os = "windows"))] // it stopped working here, don't know if it's truly broken or if it's the test. Let's wait for windows users to report.
 fn basic_user_journey_with_deletion() -> Result<()> {
     use crate::interactive::app::tests::utils::into_events;

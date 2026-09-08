@@ -513,6 +513,11 @@ impl AppState {
             .expect("us being unable to delete the root index");
         let entries_deleted =
             tree_view.remove_entries(index, true /* remove node at `index` */);
+        if let Some(scan) = self.scan.as_mut()
+            && !scan.active_traversal.prune_removed_nodes(tree_view.tree())
+        {
+            self.scan = None;
+        }
 
         if tree_view.exists(self.navigation().view_root) {
             self.entries = tree_view.sorted_entries(
