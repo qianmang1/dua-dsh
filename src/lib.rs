@@ -15,6 +15,7 @@ mod crossdev;
 mod diff;
 pub use diff::diff_snapshots;
 mod inodefilter;
+mod ndjson;
 /// Reading and writing dua traversal snapshots.
 pub mod snapshot;
 mod tree;
@@ -28,5 +29,6 @@ pub use aggregate::aggregate_entries;
 pub use aggregate::{aggregate, aggregate_replay, aggregate_snapshot};
 pub use common::*;
 pub(crate) use inodefilter::InodeFilter;
+pub use ndjson::aggregate_jsonl;
 pub use stacks::{stacks, stacks_from_replay, stacks_from_traversal};
 pub use tree::{aggregate_tree, aggregate_tree_from_replay, aggregate_tree_from_traversal};

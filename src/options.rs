@@ -378,6 +378,14 @@ pub enum Command {
             conflicts_with_all = ["statistics", "no_sort", "no_total"]
         )]
         stack: bool,
+        /// Stream the traversal as newline-delimited JSON events on stdout.
+        ///
+        /// Each line is one event: hello, entry, error, summary, or done.
+        /// Every traversed entry is emitted regardless of --depth, which has no effect here;
+        /// retention and depth limiting are left to the consuming process. Both the apparent
+        /// (len) and allocated (allocated, 0 for directories) sizes are reported per entry.
+        #[clap(long, conflicts_with_all = ["import", "stack"])]
+        jsonl: bool,
         /// Print an indented tree that descends this many levels into each input, instead of the
         /// flat listing. The inputs form the first level, so a depth of 1 lists just them.
         #[clap(short = 'd', long, conflicts_with = "statistics", value_name = "DEPTH", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]

@@ -373,6 +373,7 @@ fn main() -> Result<()> {
             no_sort,
             statistics,
             stack,
+            jsonl,
             depth,
         }) => {
             if stack {
@@ -392,7 +393,12 @@ fn main() -> Result<()> {
                     bail!("--import cannot be used with traversal options or input paths");
                 }
                 let traversal = merge_traversal_args(&global_traversal, &subcommand_traversal);
-                if let Some(path) = import {
+                if jsonl {
+                    let walk_options = walk_options_from(&traversal.scan)?;
+                    let stdout = io::stdout();
+                    let paths = jsonl_input_paths(traversal.scan.input, &walk_options)?;
+                    dua::aggregate_jsonl(stdout.lock(), walk_options, paths)?
+                } else if let Some(path) = import {
                     let mut replay = replay_snapshot_file(&path)?;
                     writeln!(
                         io::stderr(),
@@ -757,6 +763,35 @@ fn extract_aggregate_inputs_maybe_set_cwd(
     }
 
     extract_paths_maybe_set_cwd(paths, walk_options).map(AggregateInputs::Paths)
+}
+
+/// Resolve explicit inputs for `--jsonl` scans to normalized absolute paths.
+///
+/// Unlike the text-mode paths, this never changes the working directory: each input becomes a
+/// walk root itself (a directory input is reported at depth `0` with its children below it).
+/// Without any input, the current directory is scanned. Input paths excluded by ignore patterns
+/// are dropped, mirroring the text-mode CLI; explicit inputs are never subject to `--ignore-dirs`.
+fn jsonl_input_paths(
+    paths: Vec<PathBuf>,
+    walk_options: &dua::WalkOptions,
+) -> Result<Vec<PathBuf>, io::Error> {
+    let cwd = std::env::current_dir()?;
+    let paths = if paths.is_empty() {
+        vec![cwd.clone()]
+    } else {
+        paths
+    };
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = gix::path::normalize(path.as_path().into(), &cwd)
+                .map_or_else(|| path.clone(), |path| path.into_owned());
+            let excluded = walk_options.ignore_patterns.as_ref().is_some_and(|patterns| {
+                patterns.excludes_input_path(&path, &cwd)
+            });
+            (!excluded).then_some(path)
+        })
+        .collect())
 }
 
 fn extract_paths_maybe_set_cwd(
